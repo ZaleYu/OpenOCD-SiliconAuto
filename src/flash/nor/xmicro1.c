@@ -74,7 +74,6 @@ struct xmicro1_flash_bank {
 	uint32_t page_size;
 	uint32_t bank_size;
 	uint32_t coreclk_hz;   /* required for timer programming; 0 = unknown (use conservative default) */
-	bool     inited;
 };
 
 /* ==== Helpers to read/write target memory ==== */
@@ -188,9 +187,6 @@ static int xmicro1_hw_init(struct flash_bank *bank)
 	struct target *t = bank->target;
 	const uint32_t reg_base = ctx->reg_base;
 
-	if (ctx->inited)
-		return ERROR_OK;
-
 	uint32_t coreclk = ctx->coreclk_hz;
 	if (!coreclk) {
 		/* conservative default to avoid div-by-zero; adjust via `XMICRO1 coreclk` */
@@ -246,7 +242,6 @@ static int xmicro1_hw_init(struct flash_bank *bank)
 		return r;
 	}
 
-	ctx->inited = true;
 	return ERROR_OK;
 }
 
@@ -367,9 +362,9 @@ static int xmicro1_write(struct flash_bank *bank, const uint8_t *buffer,
          * - NUM = words - 1
          * - START = 1
          */
-        uint32_t ctrl = ((1u & 0x3u) << 4)           /* OP = program */
+        uint32_t ctrl = ((1u & 0x3u) << 4)               /* OP = program */
                       | (((words - 1u) & 0xFFFu) << 16)  /* NUM = words-1 */
-                      | (1u << 0);                      /* START = 1 */
+                      | (1u << 0);                       /* START = 1 */
         r = xmicro1_wr32(t, reg_base + XMICRO1_PFLASH_REG_CONTROL_OFST, ctrl);
         if (r != ERROR_OK) return r;
 
@@ -510,8 +505,7 @@ COMMAND_HANDLER(xmicro1_handle_coreclk_cmd)
 	COMMAND_PARSE_NUMBER(u32, CMD_ARGV[0], hz);
 	ctx->coreclk_hz = hz;
 	LOG_INFO("XMICRO1: set coreclk_hz=%u", (unsigned)hz);
-	/* re-init on next op */
-	ctx->inited = false;
+
 	return ERROR_OK;
 }
 
