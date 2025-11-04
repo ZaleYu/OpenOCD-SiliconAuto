@@ -22,6 +22,13 @@
 #define XMICRO1_PFLASH_SIZE              (0x00100000u) /* 1MB */
 #define XMICRO1_PFLASH_PHY_PAGE_SIZE     (0x00002000u) /* 8KB */
 
+#define XMICRO1_DFLASH_MEM_BASE          (0x20000000u)
+#define XMICRO1_DFLASH_SIZE              (0x00010000u) /* 64KB */
+#define XMICRO1_DFLASH_PHY_PAGE_SIZE     (0x00000800u) /* 2KB */
+
+#define XMICRO1_PFLASH_NS_MEM_BASE       (0x12000000u)
+#define XMICRO1_DFLASH_NS_MEM_BASE       (0x30000000u)
+
 #define XMICRO1_OP_MAX_NUM_OF_BYTES      (16384u)      /* 16KB */
 #define XMICRO1_OP_MAX_NUM_OF_WORDS      (XMICRO1_OP_MAX_NUM_OF_BYTES >> 2)
 
@@ -30,6 +37,9 @@
 #define XMICRO1_OP_TIMEOUT_LOOPS         (400u)        /* ~400 ms by alive_sleep(1) */
 
 #define XMICRO1_PFLASH_REG_BASE                      (0x40000000u)
+#define XMICRO1_DFLASH_REG_BASE                      (0x40002000u)
+
+/* The following register offsets are shared by both PFLASH and DFLASH controllers */
 #define XMICRO1_PFLASH_REG_CONTROL_OFST              (0x20u)
 #define XMICRO1_PFLASH_REG_ADDR_OFST                 (0x24u)
 #define XMICRO1_PFLASH_REG_DEFAULT_REGION_OFST       (0x90u)
@@ -417,8 +427,10 @@ static int xmicro1_probe(struct flash_bank *bank)
 {
 	struct xmicro1_flash_bank *ctx = bank->driver_priv;
 
-	/* Layout: fixed 8KB sectors across the bank size */
-	unsigned sectors = bank->size / XMICRO1_PFLASH_PHY_PAGE_SIZE;
+	if (!ctx->page_size || !bank->size)
+		return ERROR_FAIL;
+
+	unsigned sectors = bank->size / ctx->page_size;
 	if (sectors == 0)
 		return ERROR_FAIL;
 
@@ -429,13 +441,12 @@ static int xmicro1_probe(struct flash_bank *bank)
 
 	bank->num_sectors = sectors;
 	for (unsigned i = 0; i < sectors; i++) {
-		bank->sectors[i].offset = i * XMICRO1_PFLASH_PHY_PAGE_SIZE;
-		bank->sectors[i].size   = XMICRO1_PFLASH_PHY_PAGE_SIZE;
+		bank->sectors[i].offset = i * ctx->page_size;
+		bank->sectors[i].size   = ctx->page_size;
 		bank->sectors[i].is_erased = -1;
 		bank->sectors[i].is_protected = 0;
 	}
 
-	ctx->page_size = XMICRO1_PFLASH_PHY_PAGE_SIZE;
 	ctx->bank_size = bank->size;
 	return ERROR_OK;
 }
@@ -453,19 +464,30 @@ FLASH_BANK_COMMAND_HANDLER(xmicro1_flash_bank_command)
 	if (CMD_ARGC < 6)
 		return ERROR_COMMAND_SYNTAX_ERROR;
 
-	struct xmicro1_flash_bank *ctx;
-
-	ctx = calloc(1, sizeof(*ctx));
+	struct xmicro1_flash_bank *ctx = calloc(1, sizeof(*ctx));
 	if (!ctx)
 		return ERROR_FAIL;
 
 	bank->driver_priv = ctx;
 
-	/* default constants; can be overridden by args */
-	ctx->reg_base   = XMICRO1_PFLASH_REG_BASE;
-	ctx->page_size  = XMICRO1_PFLASH_PHY_PAGE_SIZE;
+	/* Decide controller macro (reg_base) and physical page size by bank->base.
+	 * PFLASH: 8KB page; DFLASH: 2KB page.
+	 * Secure/Non-secure windows share the same controller registers. */
+	if (bank->base == XMICRO1_PFLASH_MEM_BASE || bank->base == XMICRO1_PFLASH_NS_MEM_BASE) {
+		ctx->reg_base  = XMICRO1_PFLASH_REG_BASE;
+		ctx->page_size = XMICRO1_PFLASH_PHY_PAGE_SIZE;
+	} else if (bank->base == XMICRO1_DFLASH_MEM_BASE || bank->base == XMICRO1_DFLASH_NS_MEM_BASE) {
+		ctx->reg_base  = XMICRO1_DFLASH_REG_BASE;
+		ctx->page_size = XMICRO1_DFLASH_PHY_PAGE_SIZE;
+	} else {
+		/* Fallback to PFLASH defaults, but warn so users notice. */
+		ctx->reg_base  = XMICRO1_PFLASH_REG_BASE;
+		ctx->page_size = XMICRO1_PFLASH_PHY_PAGE_SIZE;
+		LOG_WARNING("XMICRO1: unknown bank base 0x%08" PRIx32 ", defaulting to PFLASH params.", bank->base);
+	}
+
 	ctx->bank_size  = bank->size;
-	ctx->coreclk_hz = 0;     /* let user set or fall back to default */
+	ctx->coreclk_hz = 0; /* let user set or fall back to default */
 
 	/* Optional extra arg: coreclk_hz */
 	if (CMD_ARGC >= 7) {
@@ -478,8 +500,16 @@ FLASH_BANK_COMMAND_HANDLER(xmicro1_flash_bank_command)
 static int xmicro1_info(struct flash_bank *bank, struct command_invocation *cmd)
 {
 	struct xmicro1_flash_bank *ctx = bank->driver_priv;
-	command_print_sameline(cmd, "XMICRO1: base=0x%08" PRIx32 ", size=%u KB, page=%u KB, reg_base=0x%08" PRIx32,
-		bank->base, (unsigned)(bank->size / 1024), (unsigned)(ctx->page_size / 1024), ctx->reg_base);
+
+	const char *which =
+		(bank->base == XMICRO1_PFLASH_MEM_BASE)    ? "PFLASH_S" :
+		(bank->base == XMICRO1_PFLASH_NS_MEM_BASE) ? "PFLASH_NS" :
+		(bank->base == XMICRO1_DFLASH_MEM_BASE)    ? "DFLASH_S" :
+		(bank->base == XMICRO1_DFLASH_NS_MEM_BASE) ? "DFLASH_NS" : "UNKNOWN";
+
+	command_print_sameline(cmd,
+		"XMICRO1 %s: base=0x%08" PRIx32 ", size=%u KB, page=%u B, reg_base=0x%08" PRIx32,
+		which, bank->base, (unsigned)(bank->size / 1024), (unsigned)(ctx->page_size), ctx->reg_base);
 	if (ctx->coreclk_hz)
 		command_print(cmd, ", coreclk=%u Hz", (unsigned)ctx->coreclk_hz);
 	else
@@ -545,4 +575,3 @@ const struct flash_driver xmicro1_flash = {
 	.info = xmicro1_info,
 	.free_driver_priv = default_flash_free_driver_priv,
 };
-
