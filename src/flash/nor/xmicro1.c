@@ -117,11 +117,8 @@ static int xmicro1_wait32(struct target *t, uint32_t addr, xmicro1_cond_fn cond,
 }
 
 static bool cond_nonzero(uint32_t v) { return v != 0; }
-static bool cond_zero(uint32_t v)    { return v == 0; }
 static bool cond_macro_idle(uint32_t v) { return (v & XMICRO1_EFM_STATUS_MACRO_BUSY) == 0; }
 static bool cond_prog_fifo_empty(uint32_t v) { return (v & XMICRO1_STATUS_PROG_FIFO_EMPTY) != 0; }
-static bool cond_prog_fifo_not_full(uint32_t v) { return (v & XMICRO1_STATUS_PROG_FIFO_FULL) == 0; }
-static bool cond_read_fifo_not_empty(uint32_t v) { return (v & XMICRO1_STATUS_READ_FIFO_EMPTY) == 0; }
 static bool cond_recall_done(uint32_t v) { return (v & XMICRO1_STATUS_RECALL_BUSY) == 0; }
 
 /* Clear OP_STATUS and ERR_CODE  */
@@ -483,7 +480,7 @@ FLASH_BANK_COMMAND_HANDLER(xmicro1_flash_bank_command)
 		/* Fallback to PFLASH defaults, but warn so users notice. */
 		ctx->reg_base  = XMICRO1_PFLASH_REG_BASE;
 		ctx->page_size = XMICRO1_PFLASH_PHY_PAGE_SIZE;
-		LOG_WARNING("XMICRO1: unknown bank base 0x%08" PRIx32 ", defaulting to PFLASH params.", bank->base);
+		LOG_WARNING("XMICRO1: unknown bank base 0x%08" PRIx32 ", defaulting to PFLASH params.", (uint32_t)bank->base);
 	}
 
 	ctx->bank_size  = bank->size;
@@ -509,7 +506,7 @@ static int xmicro1_info(struct flash_bank *bank, struct command_invocation *cmd)
 
 	command_print_sameline(cmd,
 		"XMICRO1 %s: base=0x%08" PRIx32 ", size=%u KB, page=%u B, reg_base=0x%08" PRIx32,
-		which, bank->base, (unsigned)(bank->size / 1024), (unsigned)(ctx->page_size), ctx->reg_base);
+		which, (uint32_t)bank->base, (unsigned)(bank->size / 1024), (unsigned)(ctx->page_size), ctx->reg_base);
 	if (ctx->coreclk_hz)
 		command_print(cmd, ", coreclk=%u Hz", (unsigned)ctx->coreclk_hz);
 	else
