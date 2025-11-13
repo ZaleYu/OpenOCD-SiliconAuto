@@ -13,9 +13,16 @@
 #include <helper/binarybuffer.h>
 #include <helper/time_support.h>
 #include <helper/log.h>
+#include <target/algorithm.h>
+#include <target/armv7m.h>
 #include <target/target.h>
 #include <target/cortex_m.h>
 #include <inttypes.h>
+
+#include "../../../contrib/loaders/flash/xmirco1/xmicro1_sram_algo_prog.inc"
+
+static const uint8_t *xmicro1_algo_blob_u8   = xmicro1_sram_algo_prog_bin;
+static const size_t   xmicro1_algo_blob_size = xmicro1_sram_algo_prog_bin_len;
 
 /* ==== Device-specific constants ==== */
 #define XMICRO1_PFLASH_MEM_BASE          (0x02000000u)
@@ -84,6 +91,11 @@ struct xmicro1_flash_bank {
 	uint32_t page_size;
 	uint32_t bank_size;
 	uint32_t coreclk_hz;   /* required for timer programming; 0 = unknown (use conservative default) */
+    /* --- SRAM algo cache --- */
+    struct working_area *algo_wa;
+    struct working_area *buf_wa;
+    uint32_t             buf_sz;
+    bool                 algo_loaded;
 };
 
 /* ==== Helpers to read/write target memory ==== */
@@ -335,86 +347,118 @@ static int xmicro1_write(struct flash_bank *bank, const uint8_t *buffer,
         return ERROR_FAIL;
     }
 
-    /* Controller maximum bytes per operation (e.g., 16KB) */
-    const uint32_t max_chunk = XMICRO1_OP_MAX_NUM_OF_BYTES;
+    /* --- ensure algo working areas --- */
+    if (!ctx->algo_loaded) {
+        if (!ctx->algo_wa) {
+            r = target_alloc_working_area(t, xmicro1_algo_blob_size, &ctx->algo_wa);
+            if (r != ERROR_OK) {
+                LOG_ERROR("XMICRO1: alloc algo wa failed");
+                return r;
+            }
+        }
+        r = target_write_buffer(t, ctx->algo_wa->address,
+                                xmicro1_algo_blob_size, xmicro1_algo_blob_u8);
+        if (r != ERROR_OK) {
+            LOG_ERROR("XMICRO1: write algo blob failed");
+            return r;
+        }
+        ctx->algo_loaded = true;
+    }
 
-    /* FIFO parameters (according to design doc, FIFO depth = 16 words) */
-    enum { FIFO_DEPTH_WORDS = 16 };
+    /* allocate buffer working area（max 32KB and should not be over 16KB） */
+    uint32_t desired = 32u * 1024u;
+    if (desired > XMICRO1_OP_MAX_NUM_OF_BYTES)
+        desired = XMICRO1_OP_MAX_NUM_OF_BYTES;
+
+    if (!ctx->buf_wa || ctx->buf_sz < desired) {
+        if (ctx->buf_wa)
+            target_free_working_area(t, ctx->buf_wa);
+        ctx->buf_wa = NULL;
+        ctx->buf_sz = 0;
+
+        r = target_alloc_working_area(t, desired, &ctx->buf_wa);
+        if (r != ERROR_OK) {
+            /* try to use 8KB */
+            desired = 8u * 1024u;
+            if (desired > XMICRO1_OP_MAX_NUM_OF_BYTES)
+                desired = XMICRO1_OP_MAX_NUM_OF_BYTES;
+            r = target_alloc_working_area(t, desired, &ctx->buf_wa);
+            if (r != ERROR_OK) {
+                LOG_ERROR("XMICRO1: alloc data wa failed");
+                return r;
+            }
+        }
+        ctx->buf_sz = desired;
+    }
 
     uint32_t written = 0;
     long long t_start = timeval_ms();
-    LOG_INFO("XMICRO1: write start offset=0x%08" PRIx32 ", size=%u bytes",
-             offset, count);
+
+    LOG_INFO("XMICRO1: SRAM algo write off=0x%08" PRIx32 ", size=%" PRIu32 ", buf=%u",
+             offset, count, ctx->buf_sz);
 
     while (written < count) {
-        /* Split into controller-allowed chunk, aligned to 4 bytes */
-        uint32_t chunk = MIN((uint32_t)(count - written), max_chunk);
-        chunk &= ~0x3u;  /* round down to word multiple */
-        if (chunk == 0)
-            break;
+        uint32_t chunk = MIN(count - written, ctx->buf_sz);
+        chunk &= ~0x3u;
+        if (chunk == 0) break;
 
-        /* Reset FIFO */
-        r = xmicro1_fifo_reset(t, reg_base);
-        if (r != ERROR_OK) return r;
-
-        /* Program address */
-        r = xmicro1_wr32(t, reg_base + XMICRO1_PFLASH_REG_ADDR_OFST,
-                         offset + written);
-        if (r != ERROR_OK) return r;
-
-        uint32_t words = chunk >> 2;
-
-        /* Setup CONTROL register:
-         * - OP = 1 (program)
-         * - NUM = words - 1
-         * - START = 1
-         */
-        uint32_t ctrl = ((1u & 0x3u) << 4)               /* OP = program */
-                      | (((words - 1u) & 0xFFFu) << 16)  /* NUM = words-1 */
-                      | (1u << 0);                       /* START = 1 */
-        r = xmicro1_wr32(t, reg_base + XMICRO1_PFLASH_REG_CONTROL_OFST, ctrl);
-        if (r != ERROR_OK) return r;
-
-        /* Stream data into PROG FIFO in bursts of 16 words */
-        uint32_t sent = 0;
-        while (sent < words) {
-            uint32_t burst = MIN((uint32_t)(words - sent), (uint32_t)FIFO_DEPTH_WORDS);
-
-            /* Write up to 16 words continuously */
-            for (uint32_t j = 0; j < burst; j++) {
-                uint32_t w = le_to_h_u32(&buffer[written + ((sent + j) << 2)]);
-                r = xmicro1_wr32(t, reg_base + XMICRO1_PFLASH_REG_PROG_FIFO_OFST, w);
-                if (r != ERROR_OK) return r;
-            }
-
-            sent += burst;
-
-            /* After 16 words, poll FIFO_EMPTY before sending next burst */
-            if (sent < words) {
-                r = xmicro1_wait32(t,
-                                   reg_base + XMICRO1_PFLASH_REG_STATUS_OFST,
-                                   cond_prog_fifo_empty,
-                                   XMICRO1_OP_TIMEOUT_LOOPS);
-                if (r != ERROR_OK) {
-                    LOG_ERROR("XMICRO1: FIFO empty timeout");
-                    return r;
-                }
-            }
+        r = target_write_buffer(t, ctx->buf_wa->address, chunk, &buffer[written]);
+        if (r != ERROR_OK) {
+            LOG_ERROR("XMICRO1: write buf to wa failed");
+            return r;
         }
 
-        /* Wait until controller finishes writing this chunk */
-        r = xmicro1_wait_for_idle(t, reg_base);
-        if (r != ERROR_OK) return r;
+        /* prepare Thumb arguments */
+        struct reg_param regs[4];
+        struct armv7m_algorithm arm_info;
+        memset(&arm_info, 0, sizeof(arm_info));
+        arm_info.common_magic = ARMV7M_COMMON_MAGIC;
+        arm_info.core_mode = ARM_MODE_THREAD;
+
+        init_reg_param(&regs[0], "r0", 32, PARAM_IN_OUT);
+        init_reg_param(&regs[1], "r1", 32, PARAM_OUT);
+        init_reg_param(&regs[2], "r2", 32, PARAM_OUT);
+        init_reg_param(&regs[3], "r3", 32, PARAM_OUT);
+
+        buf_set_u32(regs[0].value, 0, 32, reg_base);
+        buf_set_u32(regs[1].value, 0, 32, offset + written);
+        buf_set_u32(regs[2].value, 0, 32, ctx->buf_wa->address);
+        buf_set_u32(regs[3].value, 0, 32, (chunk >> 2)); /* words */
+
+        /* Timeout: Rough estimate is 16 KB / (tens of microseconds per word)
+					set it larger, for example around 10 seconds. */
+        r = target_run_algorithm(t,
+                                 0, NULL,                   /* no mem param */
+                                 4, regs,
+                                 ctx->algo_wa->address | 1, /* Thumb entry */
+                                 0, 10000,                  /* 10s */
+                                 &arm_info);
+
+        int retcode = 0;
+        if (r == ERROR_OK) {
+            /* r0 as the algorithm’s return code. */
+            retcode = buf_get_u32(regs[0].value, 0, 32);
+        }
+
+        for (int i = 0; i < 4; i++) destroy_reg_param(&regs[i]);
+
+        if (r != ERROR_OK) {
+            LOG_ERROR("XMICRO1: target_run_algorithm failed (%d)", r);
+            return r;
+        }
+        if (retcode != 0) {
+            LOG_ERROR("XMICRO1: algo returned %d", retcode);
+            return ERROR_FAIL;
+        }
 
         written += chunk;
 
-        /* Progress log */
         unsigned percent = (unsigned)(((uint64_t)written * 100u) / count);
         LOG_INFO("XMICRO1: written %u%% (%u/%u bytes)", percent, written, count);
     }
 
     long long t_end = timeval_ms();
-    LOG_INFO("XMICRO1: write done, total=%u bytes, elapsed=%lld ms",
+    LOG_INFO("XMICRO1: write done via SRAM algo, total=%u bytes, elapsed=%lld ms",
              written, (t_end - t_start));
 
     return (written == count) ? ERROR_OK : ERROR_FAIL;
@@ -514,6 +558,30 @@ static int xmicro1_info(struct flash_bank *bank, struct command_invocation *cmd)
 	return ERROR_OK;
 }
 
+static void xmicro1_free_driver_priv(struct flash_bank *bank)
+{
+	if (!bank || !bank->driver_priv)
+		return;
+
+	struct xmicro1_flash_bank *ctx = bank->driver_priv;
+	struct target *t = bank->target;
+
+	/* Free SRAM working areas on the target side, if they were allocated */
+	if (ctx->algo_wa) {
+		target_free_working_area(t, ctx->algo_wa);
+		ctx->algo_wa = NULL;
+	}
+
+	if (ctx->buf_wa) {
+		target_free_working_area(t, ctx->buf_wa);
+		ctx->buf_wa = NULL;
+		ctx->buf_sz = 0;
+	}
+
+	/* Finally free driver_priv itself */
+	default_flash_free_driver_priv(bank);
+}
+
 /* ==== Extra user command: 'XMICRO1 coreclk <Hz>' ==== */
 
 COMMAND_HANDLER(xmicro1_handle_coreclk_cmd)
@@ -570,5 +638,5 @@ const struct flash_driver xmicro1_flash = {
 	.auto_probe = xmicro1_auto_probe,
 	.erase_check = default_flash_blank_check,
 	.info = xmicro1_info,
-	.free_driver_priv = default_flash_free_driver_priv,
+	.free_driver_priv = xmicro1_free_driver_priv,
 };
