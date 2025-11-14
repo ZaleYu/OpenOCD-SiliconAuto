@@ -91,11 +91,11 @@ struct xmicro1_flash_bank {
 	uint32_t page_size;
 	uint32_t bank_size;
 	uint32_t coreclk_hz;   /* required for timer programming; 0 = unknown (use conservative default) */
-    /* --- SRAM algo cache --- */
-    struct working_area *algo_wa;
-    struct working_area *buf_wa;
-    uint32_t             buf_sz;
-    bool                 algo_loaded;
+	/* SRAM flash algorithm working areas */
+	struct working_area *algo_wa;
+	struct working_area *buf_wa[2]; /* ping-pong buffers */
+	uint32_t             buf_sz;    /* size of each buffer */
+	bool                 algo_loaded;
 };
 
 /* ==== Helpers to read/write target memory ==== */
@@ -331,137 +331,274 @@ static int xmicro1_erase(struct flash_bank *bank, unsigned first, unsigned last)
 static int xmicro1_write(struct flash_bank *bank, const uint8_t *buffer,
                          uint32_t offset, uint32_t count)
 {
-    struct xmicro1_flash_bank *ctx = bank->driver_priv;
-    struct target *t = bank->target;
-    const uint32_t reg_base = ctx->reg_base;
-    int r;
+	struct xmicro1_flash_bank *ctx = bank->driver_priv;
+	struct target *t = bank->target;
+	const uint32_t reg_base = ctx->reg_base;
+	int r;
 
-    /* --- Initialize controller and sanity checks --- */
-    r = xmicro1_hw_init(bank);
-    if (r != ERROR_OK)
-        return r;
+	/* --- Initialize controller and sanity checks --- */
+	r = xmicro1_hw_init(bank);
+	if (r != ERROR_OK)
+		return r;
 
-    if ((count == 0) || ((offset + count) > bank->size) || (offset & 0x3)) {
-        LOG_ERROR("XMICRO1: invalid write args (off=0x%08" PRIx32 ", count=%" PRIu32 ")",
-                  offset, count);
-        return ERROR_FAIL;
-    }
+	if ((count == 0) || ((offset + count) > bank->size) || (offset & 0x3)) {
+		LOG_ERROR("XMICRO1: invalid write args (off=0x%08" PRIx32 ", count=%" PRIu32 ")",
+		          offset, count);
+		return ERROR_FAIL;
+	}
 
-    /* --- ensure algo working areas --- */
-    if (!ctx->algo_loaded) {
-        if (!ctx->algo_wa) {
-            r = target_alloc_working_area(t, xmicro1_algo_blob_size, &ctx->algo_wa);
-            if (r != ERROR_OK) {
-                LOG_ERROR("XMICRO1: alloc algo wa failed");
-                return r;
-            }
-        }
-        r = target_write_buffer(t, ctx->algo_wa->address,
-                                xmicro1_algo_blob_size, xmicro1_algo_blob_u8);
-        if (r != ERROR_OK) {
-            LOG_ERROR("XMICRO1: write algo blob failed");
-            return r;
-        }
-        ctx->algo_loaded = true;
-    }
+	/* --- Ensure algorithm working area is allocated and loaded --- */
+	if (!ctx->algo_loaded) {
+		if (!ctx->algo_wa) {
+			r = target_alloc_working_area(t, xmicro1_algo_blob_size, &ctx->algo_wa);
+			if (r != ERROR_OK) {
+				LOG_ERROR("XMICRO1: alloc algo wa failed");
+				return r;
+			}
+		}
+		r = target_write_buffer(t, ctx->algo_wa->address,
+		                        xmicro1_algo_blob_size, xmicro1_algo_blob_u8);
+		if (r != ERROR_OK) {
+			LOG_ERROR("XMICRO1: write algo blob failed");
+			return r;
+		}
+		ctx->algo_loaded = true;
+	}
 
-    /* allocate buffer working area（max 32KB and should not be over 16KB） */
-    uint32_t desired = 32u * 1024u;
-    if (desired > XMICRO1_OP_MAX_NUM_OF_BYTES)
-        desired = XMICRO1_OP_MAX_NUM_OF_BYTES;
+	/* --- Allocate two ping-pong buffers in working area --- */
+	uint32_t desired = XMICRO1_OP_MAX_NUM_OF_BYTES; /* per-buffer size, <= 16KB */
 
-    if (!ctx->buf_wa || ctx->buf_sz < desired) {
-        if (ctx->buf_wa)
-            target_free_working_area(t, ctx->buf_wa);
-        ctx->buf_wa = NULL;
-        ctx->buf_sz = 0;
+	/* Try to keep some margin relative to target working_area_size if known */
+	if (t->working_area_size &&
+	    (desired * 2 + xmicro1_algo_blob_size > t->working_area_size)) {
+		uint32_t max_for_buffers = t->working_area_size;
+		if (max_for_buffers > xmicro1_algo_blob_size)
+			max_for_buffers -= xmicro1_algo_blob_size;
+		else
+			max_for_buffers = 0;
 
-        r = target_alloc_working_area(t, desired, &ctx->buf_wa);
-        if (r != ERROR_OK) {
-            /* try to use 8KB */
-            desired = 8u * 1024u;
-            if (desired > XMICRO1_OP_MAX_NUM_OF_BYTES)
-                desired = XMICRO1_OP_MAX_NUM_OF_BYTES;
-            r = target_alloc_working_area(t, desired, &ctx->buf_wa);
-            if (r != ERROR_OK) {
-                LOG_ERROR("XMICRO1: alloc data wa failed");
-                return r;
-            }
-        }
-        ctx->buf_sz = desired;
-    }
+		if (max_for_buffers / 2 < desired)
+			desired = max_for_buffers / 2;
+	}
 
-    uint32_t written = 0;
-    long long t_start = timeval_ms();
+	if (desired < 1024)
+		desired = 1024;
 
-    LOG_INFO("XMICRO1: SRAM algo write off=0x%08" PRIx32 ", size=%" PRIu32 ", buf=%u",
-             offset, count, ctx->buf_sz);
+	/* Allocate/resize ping-pong buffers if needed */
+	if (!ctx->buf_wa[0] || !ctx->buf_wa[1] || ctx->buf_sz < desired) {
+		/* free old ones if any */
+		for (int i = 0; i < 2; i++) {
+			if (ctx->buf_wa[i]) {
+				target_free_working_area(t, ctx->buf_wa[i]);
+				ctx->buf_wa[i] = NULL;
+			}
+		}
+		ctx->buf_sz = 0;
 
-    while (written < count) {
-        uint32_t chunk = MIN(count - written, ctx->buf_sz);
-        chunk &= ~0x3u;
-        if (chunk == 0) break;
+		r = target_alloc_working_area(t, desired, &ctx->buf_wa[0]);
+		if (r != ERROR_OK) {
+			LOG_ERROR("XMICRO1: alloc data wa[0] failed");
+			return r;
+		}
+		r = target_alloc_working_area(t, desired, &ctx->buf_wa[1]);
+		if (r != ERROR_OK) {
+			LOG_ERROR("XMICRO1: alloc data wa[1] failed");
+			target_free_working_area(t, ctx->buf_wa[0]);
+			ctx->buf_wa[0] = NULL;
+			return r;
+		}
+		ctx->buf_sz = desired;
+	}
 
-        r = target_write_buffer(t, ctx->buf_wa->address, chunk, &buffer[written]);
-        if (r != ERROR_OK) {
-            LOG_ERROR("XMICRO1: write buf to wa failed");
-            return r;
-        }
+	uint32_t written = 0;
+	long long t_start = timeval_ms();
 
-        /* prepare Thumb arguments */
-        struct reg_param regs[4];
-        struct armv7m_algorithm arm_info;
-        memset(&arm_info, 0, sizeof(arm_info));
-        arm_info.common_magic = ARMV7M_COMMON_MAGIC;
-        arm_info.core_mode = ARM_MODE_THREAD;
+	LOG_INFO("XMICRO1: SRAM algo write (ping-pong) off=0x%08" PRIx32
+	         ", size=%" PRIu32 ", buf=%u",
+	         offset, count, ctx->buf_sz);
 
-        init_reg_param(&regs[0], "r0", 32, PARAM_IN_OUT);
-        init_reg_param(&regs[1], "r1", 32, PARAM_OUT);
-        init_reg_param(&regs[2], "r2", 32, PARAM_OUT);
-        init_reg_param(&regs[3], "r3", 32, PARAM_OUT);
+	/* Nothing to do? */
+	if (count == 0) {
+		LOG_INFO("XMICRO1: nothing to write");
+		return ERROR_OK;
+	}
 
-        buf_set_u32(regs[0].value, 0, 32, reg_base);
-        buf_set_u32(regs[1].value, 0, 32, offset + written);
-        buf_set_u32(regs[2].value, 0, 32, ctx->buf_wa->address);
-        buf_set_u32(regs[3].value, 0, 32, (chunk >> 2)); /* words */
+	/* Prepare ARMv7-M algorithm context */
+	struct armv7m_algorithm arm_info;
+	memset(&arm_info, 0, sizeof(arm_info));
+	arm_info.common_magic = ARMV7M_COMMON_MAGIC;
+	arm_info.core_mode = ARM_MODE_THREAD;
 
-        /* Timeout: Rough estimate is 16 KB / (tens of microseconds per word)
-					set it larger, for example around 10 seconds. */
-        r = target_run_algorithm(t,
-                                 0, NULL,                   /* no mem param */
-                                 4, regs,
-                                 ctx->algo_wa->address | 1, /* Thumb entry */
-                                 0, 10000,                  /* 10s */
-                                 &arm_info);
+	/* We reuse the same reg_param array for each algorithm run */
+	struct reg_param regs[4];
+	init_reg_param(&regs[0], "r0", 32, PARAM_IN_OUT);
+	init_reg_param(&regs[1], "r1", 32, PARAM_OUT);
+	init_reg_param(&regs[2], "r2", 32, PARAM_OUT);
+	init_reg_param(&regs[3], "r3", 32, PARAM_OUT);
 
-        int retcode = 0;
-        if (r == ERROR_OK) {
-            /* r0 as the algorithm’s return code. */
-            retcode = buf_get_u32(regs[0].value, 0, 32);
-        }
+	const uint32_t algo_entry = ctx->algo_wa->address | 1; /* Thumb */
 
-        for (int i = 0; i < 4; i++) destroy_reg_param(&regs[i]);
+	/* -----------------------------------------------------------------
+	 * Step 1: Fill first buffer and start first algorithm run
+	 * ----------------------------------------------------------------- */
+	int buf_idx = 0;  /* current buffer index (0 or 1) */
 
-        if (r != ERROR_OK) {
-            LOG_ERROR("XMICRO1: target_run_algorithm failed (%d)", r);
-            return r;
-        }
-        if (retcode != 0) {
-            LOG_ERROR("XMICRO1: algo returned %d", retcode);
-            return ERROR_FAIL;
-        }
+	uint32_t chunk = MIN(count - written, ctx->buf_sz);
+	chunk &= ~0x3u;
+	if (chunk == 0) {
+		/* nothing word-aligned */
+		destroy_reg_param(&regs[0]);
+		destroy_reg_param(&regs[1]);
+		destroy_reg_param(&regs[2]);
+		destroy_reg_param(&regs[3]);
+		return ERROR_OK;
+	}
 
-        written += chunk;
+	r = target_write_buffer(t, ctx->buf_wa[buf_idx]->address,
+	                        chunk, &buffer[written]);
+	if (r != ERROR_OK) {
+		LOG_ERROR("XMICRO1: write buf[0] to wa failed");
+		goto out_err_regs;
+	}
 
-        unsigned percent = (unsigned)(((uint64_t)written * 100u) / count);
-        LOG_INFO("XMICRO1: written %u%% (%u/%u bytes)", percent, written, count);
-    }
+	/* Setup registers for first chunk */
+	buf_set_u32(regs[0].value, 0, 32, reg_base);
+	buf_set_u32(regs[1].value, 0, 32, offset + written);
+	buf_set_u32(regs[2].value, 0, 32, ctx->buf_wa[buf_idx]->address);
+	buf_set_u32(regs[3].value, 0, 32, (chunk >> 2)); /* words */
 
-    long long t_end = timeval_ms();
-    LOG_INFO("XMICRO1: write done via SRAM algo, total=%u bytes, elapsed=%lld ms",
-             written, (t_end - t_start));
+	r = target_start_algorithm(t,
+	                           0, NULL,      /* no mem_params */
+	                           4, regs,
+	                           algo_entry,
+	                           0,            /* no explicit exit point */
+	                           &arm_info);
+	if (r != ERROR_OK) {
+		LOG_ERROR("XMICRO1: target_start_algorithm (first chunk) failed (%d)", r);
+		goto out_err_regs;
+	}
 
-    return (written == count) ? ERROR_OK : ERROR_FAIL;
+	written += chunk;
+
+	/* -----------------------------------------------------------------
+	 * Step 2: Main ping-pong loop
+	 *
+	 * While one chunk is being programmed by the target CPU, we fill the
+	 * other buffer via SWD, then wait for completion and start the next
+	 * algorithm run on the newly filled buffer.
+	 * ----------------------------------------------------------------- */
+	while (written < count) {
+		int next_buf = buf_idx ^ 1; /* ping-pong: 0 <-> 1 */
+
+		/* Compute next chunk size */
+		uint32_t next_chunk = MIN(count - written, ctx->buf_sz);
+		next_chunk &= ~0x3u;
+		if (next_chunk == 0)
+			break;
+
+		/* Fill next buffer while the algorithm is running on buf_idx */
+		r = target_write_buffer(t, ctx->buf_wa[next_buf]->address,
+		                        next_chunk, &buffer[written]);
+		if (r != ERROR_OK) {
+			LOG_ERROR("XMICRO1: write buf[%d] to wa failed", next_buf);
+			goto out_wait_and_err; /* wait for ongoing algo before returning */
+		}
+
+		/* Wait for current algorithm run on buf_idx to finish */
+		r = target_wait_algorithm(t,
+		                          0, NULL,
+		                          4, regs,
+								  0,
+		                          10000,       /* 10s timeout per chunk */
+		                          &arm_info);
+		if (r != ERROR_OK) {
+			LOG_ERROR("XMICRO1: target_wait_algorithm failed (%d)", r);
+			goto out_err_regs;
+		}
+
+		int retcode = buf_get_u32(regs[0].value, 0, 32);
+		if (retcode != 0) {
+			LOG_ERROR("XMICRO1: algo returned %d", retcode);
+			goto out_err_regs;
+		}
+
+		/* Start algorithm run on the freshly filled next buffer */
+		buf_set_u32(regs[0].value, 0, 32, reg_base);
+		buf_set_u32(regs[1].value, 0, 32, offset + written);
+		buf_set_u32(regs[2].value, 0, 32, ctx->buf_wa[next_buf]->address);
+		buf_set_u32(regs[3].value, 0, 32, (next_chunk >> 2));
+
+		r = target_start_algorithm(t,
+		                           0, NULL,
+		                           4, regs,
+		                           algo_entry,
+		                           0,
+		                           &arm_info);
+		if (r != ERROR_OK) {
+			LOG_ERROR("XMICRO1: target_start_algorithm failed (%d)", r);
+			goto out_err_regs;
+		}
+
+		written += next_chunk;
+		buf_idx = next_buf;
+
+		unsigned percent = (unsigned)(((uint64_t)written * 100u) / count);
+		LOG_INFO("XMICRO1: written %u%% (%u/%u bytes)", percent, written, count);
+	}
+
+	/* -----------------------------------------------------------------
+	 * Step 3: Wait for the last in-flight algorithm to complete
+	 * ----------------------------------------------------------------- */
+	r = target_wait_algorithm(t,
+	                          0, NULL,
+	                          4, regs,
+							  0,
+	                          10000,
+	                          &arm_info);
+	if (r != ERROR_OK) {
+		LOG_ERROR("XMICRO1: target_wait_algorithm (last chunk) failed (%d)", r);
+		goto out_err_regs;
+	}
+
+	{
+		int retcode = buf_get_u32(regs[0].value, 0, 32);
+		if (retcode != 0) {
+			LOG_ERROR("XMICRO1: algo returned %d on last chunk", retcode);
+			goto out_err_regs;
+		}
+	}
+
+	/* Success */
+	{
+		long long t_end = timeval_ms();
+		LOG_INFO("XMICRO1: write done via SRAM algo ping-pong, total=%u bytes, elapsed=%lld ms",
+		         written, (t_end - t_start));
+	}
+
+	destroy_reg_param(&regs[0]);
+	destroy_reg_param(&regs[1]);
+	destroy_reg_param(&regs[2]);
+	destroy_reg_param(&regs[3]);
+
+	return (written == count) ? ERROR_OK : ERROR_FAIL;
+
+/* If something goes wrong after we already started an algorithm run,
+ * we should at least wait for it to halt before returning, to avoid
+ * leaving the core running an orphaned flash routine.
+ */
+out_wait_and_err:
+	(void)target_wait_algorithm(t,
+	                            0, NULL,
+	                            4, regs,
+								0,
+	                            10000,
+	                            &arm_info);
+out_err_regs:
+	destroy_reg_param(&regs[0]);
+	destroy_reg_param(&regs[1]);
+	destroy_reg_param(&regs[2]);
+	destroy_reg_param(&regs[3]);
+	return ERROR_FAIL;
 }
 
 static int xmicro1_probe(struct flash_bank *bank)
@@ -572,11 +709,13 @@ static void xmicro1_free_driver_priv(struct flash_bank *bank)
 		ctx->algo_wa = NULL;
 	}
 
-	if (ctx->buf_wa) {
-		target_free_working_area(t, ctx->buf_wa);
-		ctx->buf_wa = NULL;
-		ctx->buf_sz = 0;
+	for (int i = 0; i < 2; i++) {
+		if (ctx->buf_wa[i]) {
+			target_free_working_area(t, ctx->buf_wa[i]);
+			ctx->buf_wa[i] = NULL;
+		}
 	}
+	ctx->buf_sz = 0;
 
 	/* Finally free driver_priv itself */
 	default_flash_free_driver_priv(bank);
