@@ -62,6 +62,12 @@ static const size_t   xmicro1_algo_blob_size = xmicro1_sram_algo_prog_bin_len;
 #define XMICRO1_PFLASH_REG_OP_CTRL_OFST              (0x238u)
 #define XMICRO1_PFLASH_REG_EFM_STATUS_OFST           (0x240u)
 
+#define XMICRO1_PFLASH_REG_SMW_TIMER_OFST   (0x200u)
+#define XMICRO1_PFLASH_REG_SMW_SETA_OFST    (0x204u)
+#define XMICRO1_PFLASH_REG_SMW_SETB_OFST    (0x208u)
+#define XMICRO1_PFLASH_REG_SMW_SET2A_OFST   (0x20Cu)
+#define XMICRO1_PFLASH_REG_SMW_SET2B_OFST   (0x210u)
+
 /* STATUS / OP_STATUS bits:
  * - STATUS[2]: PROG FIFO FULL (1 = full)
  * - STATUS[1]: READ FIFO EMPTY (1 = empty)
@@ -130,7 +136,6 @@ static int xmicro1_wait32(struct target *t, uint32_t addr, xmicro1_cond_fn cond,
 
 static bool cond_nonzero(uint32_t v) { return v != 0; }
 static bool cond_macro_idle(uint32_t v) { return (v & XMICRO1_EFM_STATUS_MACRO_BUSY) == 0; }
-static bool cond_prog_fifo_empty(uint32_t v) { return (v & XMICRO1_STATUS_PROG_FIFO_EMPTY) != 0; }
 static bool cond_recall_done(uint32_t v) { return (v & XMICRO1_STATUS_RECALL_BUSY) == 0; }
 
 /* Clear OP_STATUS and ERR_CODE  */
@@ -199,6 +204,93 @@ static int xmicro1_fifo_reset(struct target *t, uint32_t reg_base)
 	return xmicro1_wr32(t, reg_base + XMICRO1_PFLASH_REG_FIFO_RST_OFST, 0x0);
 }
 
+/* Apply a moderately aggressive speed profile to the SMW timing registers.
+ *
+ * Changes:
+ *   - tpgm        : force to 1us (SETB.tpgm = 0h)
+ *   - tnvs/tnvh   : reduce by one step if possible
+ *   - ters        : reduce by one step if possible
+ *   - verf_skip   : move from default 1h -> 2h (skip verify for 1st, 2nd & post-shot)
+ *   - tpgm_post   : reduce by one step if possible
+ *   - ters_post   : reduce by one step if possible
+ *
+ * We still rely on OpenOCD's final verify_image() for end-to-end correctness.
+ */
+static int xmicro1_flash_apply_speed_profile(struct target *t, uint32_t reg_base)
+{
+	int r;
+	uint32_t v, old;
+
+	/* ------------ SMW_SETB: tpgm / tnvs / ters / ncvc_ipgm ------------ */
+	r = xmicro1_rd32(t, reg_base + XMICRO1_PFLASH_REG_SMW_SETB_OFST, &v);
+	if (r != ERROR_OK)
+		return r;
+
+	old = v;
+
+	/* tpgm [7:6]: force to 0h => 1us */
+	v &= ~(0x3u << 6);
+	v |=  (0x0u << 6);
+
+	/* tnvs [10:8]: reduce by 1 step if >0 */
+	uint32_t tnvs = (v >> 8) & 0x7u;
+	if (tnvs > 0)
+		tnvs -= 1;
+	v &= ~(0x7u << 8);
+	v |=  (tnvs & 0x7u) << 8;
+
+	/* ters [5:3]: reduce by 1 step if >0 */
+	uint32_t ters = (v >> 3) & 0x7u;
+	if (ters > 0)
+		ters -= 1;
+	v &= ~(0x7u << 3);
+	v |=  (ters & 0x7u) << 3;
+
+	/* ncvc_ipgm [2:0]: keep default for now (we do not change iteration count) */
+
+	r = xmicro1_wr32(t, reg_base + XMICRO1_PFLASH_REG_SMW_SETB_OFST, v);
+	if (r != ERROR_OK)
+		return r;
+
+	LOG_DEBUG("XMICRO1: SMW_SETB 0x%08" PRIx32 " -> 0x%08" PRIx32 " (tpgm=1us, tnvs-/ters-1)", old, v);
+
+	/* ------------ SMW_SET2A: verf_skip_cfg / tpgm_post / ters_post ------------ */
+	r = xmicro1_rd32(t, reg_base + XMICRO1_PFLASH_REG_SMW_SET2A_OFST, &v);
+	if (r != ERROR_OK)
+		return r;
+
+	old = v;
+
+	/* verf_skip_cfg [24:23]:
+	 *   default is 1h; move to 2h (skip verify for 1st, 2nd & post-shot).
+	 */
+	v &= ~(0x3u << 23);
+	v |=  (0x2u << 23);
+
+	/* tpgm_post [22:21]: reduce by 1 step if >0 */
+	uint32_t tpgm_post = (v >> 21) & 0x3u;
+	if (tpgm_post > 0)
+		tpgm_post -= 1;
+	v &= ~(0x3u << 21);
+	v |=  (tpgm_post & 0x3u) << 21;
+
+	/* ters_post [20:18]: reduce by 1 step if >0 */
+	uint32_t ters_post = (v >> 18) & 0x7u;
+	if (ters_post > 0)
+		ters_post -= 1;
+	v &= ~(0x7u << 18);
+	v |=  (ters_post & 0x7u) << 18;
+
+	r = xmicro1_wr32(t, reg_base + XMICRO1_PFLASH_REG_SMW_SET2A_OFST, v);
+	if (r != ERROR_OK)
+		return r;
+
+	LOG_DEBUG("XMICRO1: SMW_SET2A 0x%08" PRIx32 " -> 0x%08" PRIx32
+	          " (verf_skip_cfg=2h, tpgm_post-/ters_post-1)", old, v);
+
+	return ERROR_OK;
+}
+
 /* Initialize controller registers */
 static int xmicro1_hw_init(struct flash_bank *bank)
 {
@@ -259,6 +351,13 @@ static int xmicro1_hw_init(struct flash_bank *bank)
 	if (r != ERROR_OK) {
 		LOG_ERROR("XMICRO1: recall timeout");
 		return r;
+	}
+
+	/* Apply conservative speed profile on top of the recalled defaults. */
+	r = xmicro1_flash_apply_speed_profile(t, reg_base);
+	if (r != ERROR_OK) {
+		LOG_WARNING("XMICRO1: safe speed profile failed, falling back to defaults");
+		/* Not fatal for flash programming; we just keep default timings. */
 	}
 
 	return ERROR_OK;
